@@ -137,7 +137,7 @@ python -m eval.redteam <run_id>  # corrupts verified claims, measures the verifi
 ### Results
 _Paste the tables from `eval/RESULTS.md` and `eval/REDTEAM.md` here after running (numbers must come from your own run)._
 
-## Honest limits (not production-complete)
+## Honest limits
 - SQLite + background threads: one instance only. Multi-instance needs Postgres and a job queue (Celery/RQ).
 - DuckDuckGo search and HTML-only fetch: no PDFs or JavaScript-rendered pages. A real search API is the best upgrade.
 - LLM verification reduces but cannot eliminate errors; the red-team table shows where it is weakest.
