@@ -1,0 +1,456 @@
+<!doctype html>
+<!-- DeepDive live dashboard.
+     One screen shows: which agent is running now, every pipeline step's state (pending / running / done / degraded /
+     failed / skipped), counters (claims, sources, cost, tokens), a live filterable log, the LLM-call feed, circuit-breaker
+     states, all recent runs, and finally the cited report + follow-up chat.
+     Data comes from two cheap endpoints: GET /api/runs (run list) and GET /api/runs/{id}/live?since=N (snapshot + NEW log lines). -->
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DeepDive — live research dashboard</title>
+<style>
+ :root{--bd:#d9dde4;--mut:#667;--ok:#1a8f4b;--warn:#c77700;--err:#d03030;--run:#1f5eff;--bg2:#f5f7fa}
+ *{box-sizing:border-box} body{font:15px/1.5 system-ui,sans-serif;max-width:1250px;margin:1rem auto;padding:0 1rem;color:#1a1a1a}
+ h1{margin:.2rem 0} h3{margin:.1rem 0 .5rem;font-size:.95rem} small,.mut{color:var(--mut)}
+ textarea{width:100%;height:60px;padding:.5rem;font:inherit}
+ button{padding:.45rem .9rem;font:inherit;border:0;border-radius:6px;background:var(--run);color:#fff;cursor:pointer}
+ button.ghost{background:#fff;color:#223;border:1px solid var(--bd)}
+ .card{border:1px solid var(--bd);border-radius:10px;padding:.8rem;margin-bottom:.8rem;background:#fff}
+ .row{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}
+ .grid{display:grid;grid-template-columns:minmax(330px,1fr) 1.5fr;gap:.9rem;align-items:start}
+ .grid>div{min-width:0}  /* lets grid children shrink instead of forcing horizontal scroll on phones */
+ @media(max-width:900px){.grid{grid-template-columns:minmax(0,1fr)}}
+ /* status pills (run level) and chips (counters) */
+ .pill{display:inline-block;padding:.05rem .55rem;border-radius:99px;font-size:.78rem;background:#eef;color:#223;border:1px solid var(--bd)}
+ .pill.running,.pill.queued{background:#e8efff;color:var(--run);border-color:#b7c9ff}
+ .pill.done{background:#e6f6ec;color:var(--ok);border-color:#b5e0c5}
+ .pill.partial,.pill.degraded{background:#fff3df;color:var(--warn);border-color:#f0d29b}
+ .pill.failed,.pill.failed_verifier_down,.pill.failed_auth,.pill.error,.pill.budget_exceeded,.pill.timeout,.pill.interrupted{background:#fde9e9;color:var(--err);border-color:#f1b8b8}
+ .chip{background:var(--bg2);border-radius:8px;padding:.15rem .55rem;font-size:.82rem;border:1px solid var(--bd)}
+ .chip b{font-weight:600}
+ /* "now running" banner */
+ #now{display:flex;gap:.6rem;align-items:center;background:#eef3ff;border:1px solid #c7d6ff}
+ #now.idle{background:var(--bg2);border-color:var(--bd)}
+ /* pipeline steps */
+ .step{display:grid;grid-template-columns:26px 1fr auto;gap:.5rem;padding:.45rem .4rem;border-bottom:1px solid #eef0f3;border-left:3px solid transparent}
+ .step:last-child{border-bottom:0}
+ .step.running{background:#f2f6ff;border-left-color:var(--run)} .step.failed,.step.interrupted{background:#fff3f3;border-left-color:var(--err)}
+ .step.degraded{border-left-color:var(--warn)} .step.done{border-left-color:var(--ok)}
+ .step .nm{font-weight:600} .step .act{font-size:.8rem;color:var(--mut);word-break:break-word}
+ .step .err{font-size:.8rem;color:var(--err)}
+ .ico{width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:.8rem;color:#fff;background:#b9bfca}
+ .ico.done{background:var(--ok)} .ico.degraded{background:var(--warn)} .ico.failed,.ico.interrupted{background:var(--err)} .ico.skipped{background:#d5d9e0}
+ .ico.running{background:#fff;border:3px solid #cfdcff;border-top-color:var(--run);animation:spin .9s linear infinite}
+ @keyframes spin{to{transform:rotate(360deg)}}
+ /* log console */
+ #log{height:360px;overflow:auto;background:#0f1420;color:#d6dbe6;border-radius:8px;padding:.5rem;font:12.5px/1.45 ui-monospace,Menlo,Consolas,monospace}
+ .ln{white-space:pre-wrap;word-break:break-word;border-bottom:1px solid #1a2132;padding:1px 0}
+ .ln .t{color:#7d889f;margin-right:.4rem} .ln .ag{color:#8fb4ff;margin-right:.4rem}
+ .ln.ok .tx{color:#7ee0a1} .ln.warn .tx{color:#ffc766} .ln.error .tx{color:#ff8a8a} .ln.reject .tx{color:#ff9fc0}
+ table{border-collapse:collapse;width:100%;font-size:.8rem} td,th{padding:.2rem .4rem;text-align:left;border-bottom:1px solid #eef0f3}
+ tr.bad td{color:var(--err)} .scroll{max-height:200px;overflow:auto}
+ .runitem{cursor:pointer} .runitem.sel{outline:2px solid var(--run)}
+ select,input[type=text]{padding:.3rem;font:inherit;border:1px solid var(--bd);border-radius:6px}
+ /* output tabs */
+ .tab.on{background:var(--run);color:#fff;border-color:var(--run)}
+ /* report embedded as a fragment: sentences are clickable and reveal their supporting quote */
+ .rpt h1{font-size:1.3rem} .rpt h2{font-size:1.05rem;margin-top:1.2rem} .rpt .lim,.rpt .ban{background:#fff6e0;padding:.4rem .7rem;border-radius:6px}
+ .rpt .box{background:var(--bg2);padding:.7rem;border-radius:8px;margin-top:1rem}
+ .rpt .s{cursor:pointer;border-bottom:1px dotted #8896ad} .rpt .s:hover{background:#fff7c2}
+ mark{background:#ffe27a} .evp{border-left:3px solid #ccd;padding:.2rem .6rem;margin:.3rem 0;font-size:.85rem}
+ pre.io{white-space:pre-wrap;word-break:break-word;max-height:220px;overflow:auto;background:var(--bg2);padding:.5rem;border-radius:6px;font:12px/1.45 ui-monospace,Menlo,monospace}
+ details{margin:.3rem 0} summary{cursor:pointer}
+ /* proof tab, side-by-side removed claims, handoff flow, per-sentence independent verdicts */
+ .crit{border:1px solid var(--bd);border-radius:10px;padding:.7rem;margin-bottom:.6rem;background:#fff}
+ .cmp{display:grid;grid-template-columns:1fr 1fr;gap:.8rem;margin:.4rem 0} @media(max-width:700px){.cmp{grid-template-columns:minmax(0,1fr)}}
+ .cmp-card{border:1px solid var(--bd);border-radius:10px;padding:.7rem;margin-bottom:.7rem}
+ .cmp-card .why{background:#fff3f3;border-radius:6px;padding:.35rem .6rem;font-size:.85rem}
+ mark.bad{background:#ffc9c9;color:#a00}
+ .hand{padding:.3rem .5rem;border-left:3px solid var(--ok);margin:.25rem 0} .hand.loop{border-left-color:var(--warn);background:#fffaf0} .arrow{color:var(--mut)}
+ .rpt .s.v-supported{border-bottom:2px solid var(--ok)} .rpt .s.v-partial{border-bottom:2px solid var(--warn);background:#fff7e6} .rpt .s.v-bad{border-bottom:2px solid var(--err);background:#fde9e9}
+</style>
+
+<h1>DeepDive <small>live research dashboard</small></h1>
+<textarea id="q">What are the main risks of investing in the EV battery market in 2026?</textarea>
+<div class="row" style="margin:.4rem 0">
+ <input type="file" id="files" multiple accept=".txt,.md"> <button onclick="start()">Investigate</button>
+ <span id="startmsg" class="mut"></span>
+</div>
+
+<!-- Recent runs: completed / ongoing / failed at a glance; click one to watch it -->
+<div class="card"><h3>Runs</h3><div id="runs" class="row"><span class="mut">no runs yet</span></div></div>
+
+<!-- Run header: status, elapsed, spend, counters -->
+<div class="card" id="bar" style="display:none">
+ <div class="row"><span id="stat" class="pill">–</span><b id="rq" style="flex:1"></b><button id="resume" class="ghost" style="display:none" onclick="resume()" title="Continue from where the run stopped, reusing stored evidence and verdicts">Resume run</button><span class="mut" id="elapsed"></span></div>
+ <div class="row" style="margin-top:.5rem" id="chips"></div>
+</div>
+<div class="card idle" id="now" style="display:none"><span id="nowico" class="ico">•</span><div><b id="nowtitle"></b><div class="mut" id="nowact"></div></div></div>
+
+<div class="grid">
+ <div>
+  <div class="card"><h3>Pipeline — what each agent is doing</h3><div class="row" id="stepsum" style="margin-bottom:.4rem"></div><div id="steps"></div></div>
+  <div class="card"><h3>Issues (warnings, failures)</h3><div id="issues" class="scroll mut">none</div></div>
+  <div class="card"><h3>Model health (circuit breakers)</h3><div id="breakers" class="row mut">–</div></div>
+ </div>
+ <div>
+  <div class="card">
+   <div class="row" style="margin-bottom:.4rem"><h3 style="margin:0;flex:1">Live log</h3>
+    <select id="lvl" onchange="renderLog()"><option value="">all levels</option><option>info</option><option>ok</option><option>warn</option><option>error</option><option value="reject">rejected</option></select>
+    <select id="agf" onchange="renderLog()"><option value="">all agents</option></select>
+    <input type="text" id="txt" placeholder="search…" oninput="renderLog()" size="12">
+    <label class="mut"><input type="checkbox" id="auto" checked> autoscroll</label>
+    <button class="ghost" onclick="dl()">download</button></div>
+   <div id="log"></div>
+  </div>
+  <div class="card"><h3>LLM calls (model, tokens, cost, latency) <small>— click a row to read the exact prompt and answer</small></h3><div class="scroll"><table><thead><tr><th>t</th><th>role</th><th>model</th><th>tok</th><th>$</th><th>ms</th><th></th></tr></thead><tbody id="calls"></tbody></table></div></div>
+  <div class="card" id="io" style="display:none"></div>
+ </div>
+</div>
+
+<!-- Outputs: everything the system generated, readable in one place -->
+<div class="card" id="rep" style="display:none">
+ <div class="row" style="margin-bottom:.6rem"><h3 style="margin:0;margin-right:.6rem">Outputs</h3>
+  <button class="ghost tab on" data-t="report" onclick="tab('report')">Report</button>
+  <button class="ghost tab" data-t="proof" onclick="tab('proof')">Proof</button>
+  <button class="ghost tab" data-t="handoffs" onclick="tab('handoffs')">Agents &amp; handoffs</button>
+  <button class="ghost tab" data-t="removed" onclick="tab('removed')">Removed claims</button>
+  <button class="ghost tab" data-t="claims" onclick="tab('claims')">Claims</button>
+  <button class="ghost tab" data-t="evidence" onclick="tab('evidence')">Evidence</button>
+  <button class="ghost tab" data-t="selfeval" onclick="tab('selfeval')">Self-evaluation</button>
+  <button class="ghost tab" data-t="followups" onclick="tab('followups')">Follow-ups</button>
+  <button class="ghost tab" data-t="files" onclick="tab('files')">Files</button></div>
+ <div id="t-report"><div class="row" style="margin-bottom:.4rem"><button class="ghost" onclick="recheck()">Independently re-check every citation</button><span id="rcmsg" class="mut"></span></div><div id="report"><span class="mut">The report appears here when the run finishes. Click any sentence to see its supporting quote.</span></div>
+  <div class="card" id="evpop" style="display:none"></div>
+  <hr><div class="row"><input type="text" id="fq" style="flex:1" placeholder="Ask a follow-up (answers only from verified claims)…"><button onclick="ask()">Ask</button></div><div id="fa"></div></div>
+ <div id="t-claims" style="display:none"><div class="row" style="margin-bottom:.4rem"><select id="cf" onchange="drawClaims()"><option value="">all claims</option><option>verified</option><option>flagged</option><option>rejected</option><option>pending</option></select><span class="mut" id="cn"></span></div><div class="scroll" style="max-height:420px"><table><thead><tr><th>#</th><th>status</th><th>stage</th><th>claim</th><th>quote</th><th>source</th><th>why</th></tr></thead><tbody id="ctab"></tbody></table></div></div>
+ <div id="t-evidence" style="display:none"></div>
+ <div id="t-followups" style="display:none"></div>
+ <div id="t-proof" style="display:none"></div>
+ <div id="t-handoffs" style="display:none"></div>
+ <div id="t-removed" style="display:none"></div>
+ <div id="t-selfeval" style="display:none"></div>
+ <div id="t-files" style="display:none"></div>
+</div>
+
+<script>
+// ---------- state ----------
+let rid = null, since = 0, timer = null, logs = [], agents = new Set(), finalFetched = false;
+const KEY = new URLSearchParams(location.search).get('key');           // optional ?key=... when the API is key-protected
+const H = KEY ? {'X-API-Key': KEY} : {};                                // headers for every API call
+const $ = id => document.getElementById(id);
+// Escape everything that comes from the server: log text contains web-derived strings.
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const api = (p, o={}) => fetch(p, {...o, headers: {...H, ...(o.headers||{})}});
+const RESUMABLE = new Set(['failed_verifier_down','budget_exceeded','timeout','interrupted','partial','error','failed_auth']);
+let claimsCache = null, evCache = null, proofCache = null;
+const ICON = {pending:'', running:'', done:'✓', degraded:'!', failed:'✕', interrupted:'✕', skipped:'–'};
+
+// ---------- start / select a run ----------
+async function start(){
+  const fd = new FormData(); fd.append('question', $('q').value);
+  for (const f of $('files').files) fd.append('files', f);
+  const r = await api('/api/runs', {method:'POST', body:fd});
+  if (!r.ok) { $('startmsg').textContent = 'could not start: ' + ((await r.json()).detail || r.status); return; }
+  $('startmsg').textContent = ''; select((await r.json()).run_id);
+}
+function select(id){                       // switch the dashboard to a run and (re)start polling
+  rid = id; since = 0; logs = []; agents = new Set(); finalFetched = false;
+  $('log').innerHTML = ''; $('agf').innerHTML = '<option value="">all agents</option>'; $('io').style.display = 'none';
+  $('rep').style.display = 'block'; claimsCache = evCache = proofCache = null; $('report').innerHTML = '<span class="mut">The report appears here when the run finishes. Click any sentence to see its supporting quote.</span>'; tab('report');
+  clearInterval(timer); poll(); timer = setInterval(poll, 1200); loadRuns();
+}
+
+// ---------- run list (completed / ongoing / failed) ----------
+async function loadRuns(){
+  const rs = await (await api('/api/runs')).json();
+  $('runs').innerHTML = rs.length ? rs.map(r => `<span class="chip runitem ${r.id==rid?'sel':''}" onclick="select(${r.id})" title="${esc(r.question)}">
+     #${r.id} <span class="pill ${esc(r.status)}">${esc(r.status)}</span> $${(+r.cost_usd).toFixed(3)}</span>`).join('') : '<span class="mut">no runs yet</span>';
+  return rs;
+}
+
+// ---------- polling: one snapshot call per tick ----------
+async function poll(){
+  if (rid == null) return;
+  const r = await api(`/api/runs/${rid}/live?since=${since}`);
+  if (!r.ok) return;
+  const s = await r.json();
+  paint(s);
+  logs.push(...s.logs); since = s.next_since; s.logs.forEach(l => agents.add(l.agent)); syncAgents(); appendLog(s.logs);
+  if (s.run.terminal) {                    // one last refresh, then stop polling and show the report
+    clearInterval(timer); loadRuns();
+    if (!finalFetched) { finalFetched = true; showReport(); }
+  }
+}
+
+// ---------- painting ----------
+function paint(s){
+  const c = s.counters, run = s.run;
+  $('bar').style.display = 'block';
+  $('stat').textContent = run.status; $('stat').className = 'pill ' + run.status;
+  $('resume').style.display = (run.terminal && RESUMABLE.has(run.status)) ? 'inline-block' : 'none';
+  $('rq').textContent = run.question; $('elapsed').textContent = run.elapsed_s + 's elapsed';
+  $('chips').innerHTML = [
+    ['verified', c.claims.verified], ['flagged', c.claims.flagged], ['rejected', c.claims.rejected], ['pending', c.claims.pending],
+    ['sources', c.evidence.sources], ['passages', c.evidence.passages],
+    ['LLM calls', c.llm_calls + (c.failed_calls ? ` (${c.failed_calls} failed)` : '')], ['fallbacks', c.fallbacks],
+    ['tokens', c.tokens], ['cost', '$' + c.cost_usd]
+  ].map(([k, v]) => `<span class="chip">${esc(k)} <b>${esc(v)}</b></span>`).join('');
+  // "now running" banner
+  const running = s.steps.filter(x => x.state === 'running');
+  $('now').style.display = 'flex'; $('now').className = 'card' + (running.length ? '' : ' idle');
+  $('nowico').className = 'ico ' + (running.length ? 'running' : (run.terminal ? (run.status === 'done' ? 'done' : 'failed') : ''));
+  $('nowico').textContent = running.length ? '' : (run.terminal ? (run.status === 'done' ? '✓' : '✕') : '•');
+  $('nowtitle').textContent = running.length ? 'Running now: ' + running.map(x => x.label).join(', ')
+                                             : (run.terminal ? 'Run ' + run.status : 'Waiting to start');
+  $('nowact').textContent = running.length ? (running[running.length-1].last_action || 'working…') : (run.error || '');
+  // pipeline: one row per agent step, with state, loop count, time and its latest action
+  const n = st => s.steps.filter(x => x.state === st).length;
+  $('stepsum').innerHTML = `<span class="chip">completed <b>${n('done') + n('degraded')}</b></span><span class="chip">ongoing <b>${n('running')}</b></span>
+    <span class="chip">failed <b>${n('failed') + n('interrupted')}</b></span><span class="chip">waiting <b>${n('pending')}</b></span><span class="chip">skipped <b>${n('skipped')}</b></span>`;
+  $('steps').innerHTML = s.steps.map(x => `<div class="step ${esc(x.state)}">
+     <span class="ico ${esc(x.state)}">${ICON[x.state] ?? ''}</span>
+     <div><div class="nm">${esc(x.label)} <span class="mut" style="font-weight:400">— ${esc(x.does)}</span></div>
+       ${x.last_action ? `<div class="act">${esc(x.last_action)}</div>` : ''}
+       ${x.error ? `<div class="err">${esc(x.error)}</div>` : ''}
+       ${x.degraded.length ? `<div class="err" style="color:var(--warn)">degraded: ${esc(x.degraded.join(', '))}</div>` : ''}</div>
+     <div class="mut" style="text-align:right;font-size:.8rem">${esc(x.state)}${x.runs > 1 ? ` · ×${x.runs}` : ''}${x.seconds ? `<br>${x.seconds}s` : ''}</div></div>`).join('');
+  // LLM call feed (most recent calls); failed calls are highlighted
+  $('calls').innerHTML = s.llm_calls.slice().reverse().map(u => `<tr class="${u.ok ? '' : 'bad'}" style="cursor:pointer" onclick="showIO(${u.id})"><td>${u.t}</td><td>${esc(u.role)}</td><td>${esc(u.model)}</td>
+     <td>${u.tokens}</td><td>${u.cost}</td><td>${u.ms}</td><td>${u.ok ? (u.fallback ? 'fallback' : 'ok') : esc((u.error || 'failed').slice(0, 40))}</td></tr>`).join('');
+  $('breakers').innerHTML = Object.keys(s.breakers).length ? Object.entries(s.breakers).map(([m, v]) =>
+     `<span class="chip">${esc(m)} <b style="color:${v === 'open' ? 'var(--err)' : 'var(--ok)'}">${esc(v)}</b></span>`).join('') : 'no model calls yet';
+}
+
+// ---------- log console ----------
+// Rejected claims / dropped sentences are EXPECTED outcomes of verification, not failures: give them their own level.
+const lvlOf = l => (l.event === 'claim_verdict' && l.level === 'error') || l.event === 'sentence_dropped' ? 'reject' : l.level;
+function lineHTML(l){ return `<div class="ln ${lvlOf(l)}"><span class="t">${l.t}s</span><span class="ag">${esc(l.agent)}</span><span class="tx">${esc(l.text)}</span></div>`; }
+function passes(l){
+  const lv = $('lvl').value, ag = $('agf').value, tx = $('txt').value.toLowerCase();
+  return (!lv || lvlOf(l) === lv) && (!ag || l.agent === ag) && (!tx || l.text.toLowerCase().includes(tx));
+}
+function appendLog(newLines){              // incremental: only add the new lines that pass the current filters
+  const box = $('log'); box.insertAdjacentHTML('beforeend', newLines.filter(passes).map(lineHTML).join(''));
+  while (box.children.length > 1500) box.removeChild(box.firstChild);   // keep the DOM small
+  if ($('auto').checked) box.scrollTop = box.scrollHeight;
+  const issues = logs.filter(l => ['warn', 'error'].includes(lvlOf(l))).slice(-25).reverse();
+  $('issues').innerHTML = issues.length ? issues.map(l => `<div class="ln" style="color:${lvlOf(l) === 'error' ? 'var(--err)' : 'var(--warn)'}">${l.t}s ${esc(l.agent)}: ${esc(l.text)}</div>`).join('') : 'none';
+}
+function renderLog(){ $('log').innerHTML = logs.filter(passes).map(lineHTML).join(''); if ($('auto').checked) $('log').scrollTop = $('log').scrollHeight; }
+function syncAgents(){                     // keep the agent filter list in sync with agents seen in the log
+  const sel = $('agf'), have = new Set([...sel.options].map(o => o.value));
+  agents.forEach(a => { if (!have.has(a)) sel.add(new Option(a, a)); });
+}
+function dl(){                             // download the whole log as JSON (useful as evidence in a bug report)
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([JSON.stringify(logs, null, 1)], {type: 'application/json'}));
+  a.download = `deepdive-run-${rid}-log.json`; a.click();
+}
+
+// ---------- outputs: report, claims, evidence, follow-ups, files ----------
+const TABS = ['report', 'proof', 'handoffs', 'removed', 'claims', 'evidence', 'selfeval', 'followups', 'files'];
+function tab(name){                          // show one output tab and load its data on demand
+  TABS.forEach(t => { $('t-' + t).style.display = t === name ? 'block' : 'none';
+                      document.querySelector(`[data-t=${t}]`).classList.toggle('on', t === name); });
+  if (rid == null) return;
+  if (name === 'claims') loadClaims(); else if (name === 'evidence') loadEvidence();
+  else if (name === 'followups') loadFollowups(); else if (name === 'files') renderFiles();
+  else if (name === 'proof') loadProof(); else if (name === 'handoffs') loadHandoffs();
+  else if (name === 'removed') loadRemoved(); else if (name === 'selfeval') loadSelfEval();
+}
+// The report is requested as an HTML FRAGMENT (no page styles) so it cannot restyle the dashboard.
+async function showReport(){
+  const r = await api(`/api/runs/${rid}/report.html?fragment=true`);
+  $('report').innerHTML = r.ok ? await r.text()
+    : '<p class="mut">No report was produced for this run. See the Claims, Evidence and Files tabs and the log for what happened.</p>';
+  if (r.ok) loadProof().then(paintRecheck);   // paint any stored independent-check verdicts onto the sentences
+}
+const hostOf = u => { try { return new URL(u).hostname.replace(/^www\./, ''); } catch (e) { return u; } };
+const link = u => /^https?:/.test(u) ? `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(hostOf(u))}</a>` : esc(u);
+
+async function loadClaims(){ claimsCache = await (await api(`/api/runs/${rid}/claims`)).json(); drawClaims(); }
+function drawClaims(){                       // every claim with verdict, deciding stage, quote and source
+  if (!claimsCache) return;
+  const f = $('cf').value, rows = claimsCache.filter(c => !f || c.status === f);
+  $('cn').textContent = rows.length + ' of ' + claimsCache.length;
+  $('ctab').innerHTML = rows.map(c => `<tr><td>${c.claim_id}${c.origin === 'followup' ? ' <small>(follow-up)</small>' : ''}</td>
+    <td><span class="pill ${c.status === 'rejected' ? 'failed' : (c.status === 'flagged' ? 'degraded' : (c.status === 'verified' ? 'done' : ''))}">${esc(c.status)}</span></td>
+    <td>${esc(c.stage || '')}</td><td>${esc(c.claim)}</td><td class="mut">${esc(c.quote || '')}</td><td>${c.source_url ? link(c.source_url) : ''}</td><td class="mut">${esc(c.reason || '')}</td></tr>`).join('');
+}
+async function loadEvidence(){               // every retrieved passage, grouped by source, with the claims citing it
+  evCache = await (await api(`/api/runs/${rid}/evidence`)).json();
+  const by = {}; evCache.forEach(e => (by[e.url] = by[e.url] || []).push(e));
+  $('t-evidence').innerHTML = Object.entries(by).map(([u, list]) => `<details><summary><b>${esc(hostOf(u))}</b> · quality ${list[0].quality} (${esc(list[0].quality_reason)}) · ${list.length} passage(s)</summary>
+     ${list.map(e => `<div class="evp"><div class="mut">${esc(e.subquestion)} · round ${e.round + 1} · cited by: ${e.cited_by.map(c => 'C' + c.claim_id + ' (' + c.status + ')').join(', ') || 'none'}</div>${esc(e.text)}</div>`).join('')}</details>`).join('') || '<span class="mut">no evidence stored yet</span>';
+}
+async function loadFollowups(){
+  const f = await (await api(`/api/runs/${rid}/followups`)).json();
+  $('t-followups').innerHTML = f.map(x => `<div class="evp"><b>${esc(x.question)}</b> <small class="mut">${esc(x.time)}</small><br>
+     ${x.answer.map(a => `${esc(a.text)} <sup>[${a.cite}]</sup>`).join('<br>') || esc(x.note || '')}<br><small class="mut">${x.rejected} unsupported claims rejected</small></div>`).join('') || '<span class="mut">no follow-up questions asked yet</span>';
+}
+// Files: everything generated, downloadable (fetched with the API key header, so it works when auth is on).
+function renderFiles(){
+  const F = [['Everything (zip bundle)', 'bundle.zip'], ['Report (Markdown)', 'report.md'], ['Report (HTML, printable)', 'report.html'],
+             ['Report (JSON)', 'report.json'], ['Claims (JSON)', 'claims'], ['Evidence (JSON)', 'evidence'], ['Audit log (text)', 'log.txt'],
+             ['Cost and usage (JSON)', 'cost'], ['Follow-ups (JSON)', 'followups']];
+  $('t-files').innerHTML = '<div class="row">' + F.map(([l, p]) => `<button class="ghost" onclick="getFile('${p}')">${l}</button>`).join('') +
+    '</div><p class="mut">The zip contains all of these plus the full audit trail and the exact prompt and answer of every LLM call.</p>';
+}
+async function getFile(path){
+  const r = await api(`/api/runs/${rid}/${path}`);
+  if (!r.ok) { alert((await r.json()).detail || 'not available'); return; }
+  const a = document.createElement('a'); a.href = URL.createObjectURL(await r.blob());
+  a.download = `deepdive-run-${rid}-${path.replace(/\//g, '-')}${/\.\w+$/.test(path) ? '' : '.json'}`; a.click();
+}
+// Click a report sentence -> show the claim(s) behind it, the verbatim quote highlighted inside the source passage.
+function hl(text, quote){
+  const i = quote ? text.toLowerCase().indexOf(quote.toLowerCase().trim()) : -1;
+  return i < 0 ? esc(text) : esc(text.slice(0, i)) + '<mark>' + esc(text.slice(i, i + quote.trim().length)) + '</mark>' + esc(text.slice(i + quote.trim().length));
+}
+async function onSentence(ev){
+  const el = ev.target.closest('.s'); if (!el) return;
+  if (!claimsCache) await loadClaims();
+  if (!evCache) await loadEvidence();
+  if (!proofCache) await loadProof();
+  const rc = proofCache && proofCache.citations.recheck, vx = rc && rc.results.find(x => x.loc === el.dataset.loc);
+  const box = $('evpop'); box.style.display = 'block';
+  box.innerHTML = '<div class="row"><b style="flex:1">Evidence behind this sentence ' + (vx ? `<span class="pill ${vx.verdict === 'supported' ? 'done' : 'failed'}">independent check: ${esc(vx.verdict)}</span>` : '') + '</b><button class="ghost" onclick="$(\'evpop\').style.display=\'none\'">close</button></div>' +
+    el.dataset.c.split(',').map(Number).map(id => {
+      const c = claimsCache.find(x => x.claim_id === id), e = c && evCache.find(x => x.evidence_id === c.evidence_id);
+      return c ? `<div class="evp"><b>Claim ${id}</b> <span class="pill">${esc(c.status)}</span> — ${esc(c.claim)}<br>
+        <span class="mut">source: ${c.source_url ? link(c.source_url) : ''} (quality ${c.source_quality})</span>
+        <div>${e ? hl(e.text, c.quote) : ''}</div></div>` : '';
+    }).join('');
+}
+// LLM call viewer: the exact prompt and answer behind any generated text.
+async function showIO(id){
+  const r = await api(`/api/runs/${rid}/llm/${id}`), box = $('io'); box.style.display = 'block';
+  if (!r.ok) { box.innerHTML = '<h3>Prompt and answer</h3><span class="mut">' + esc((await r.json()).detail) + '</span>'; return; }
+  const j = await r.json();
+  box.innerHTML = `<div class="row"><h3 style="flex:1;margin:0">${esc(j.role)} → ${esc(j.model)}</h3><button class="ghost" onclick="$('io').style.display='none'">close</button></div>
+    <b>System prompt</b><pre class="io">${esc(j.system_prompt)}</pre><b>User prompt</b><pre class="io">${esc(j.user_prompt)}</pre><b>Answer</b><pre class="io">${esc(j.response)}</pre>`;
+}
+// Follow-up question: answered only from verified claims; persisted and shown in the Follow-ups tab.
+async function ask(){
+  const r = await api(`/api/runs/${rid}/followup`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({question: $('fq').value})});
+  if (!r.ok) { $('fa').textContent = (await r.json()).detail; return; }
+  const j = await r.json();
+  $('fa').innerHTML = (j.answer.map(a => `<p>${esc(a.text)} <sup>[${a.cite}]</sup></p>`).join('') || `<p>${esc(j.note)}</p>`) +
+    j.sources.map(s => `<small>[${s.n}] ${esc(s.url)}</small><br>`).join('') + `<small>${j.rejected} unsupported claims rejected</small>`;
+  claimsCache = null;
+}
+// Resume a stopped run (verifier outage, budget, timeout, crash) with a fresh allowance; stored work is reused.
+async function resume(){
+  if (!confirm('Resume this run from where it stopped? It reuses stored evidence and verdicts and gets a fresh budget allowance.')) return;
+  const r = await api(`/api/runs/${rid}/resume`, {method:'POST'});
+  if (!r.ok) { alert((await r.json()).detail); return; }
+  select(rid);
+}
+// ---------- proof of quality: the four things a reviewer should be able to verify ----------
+const stp = (s, t) => `<span class="pill ${s === 'ok' ? 'done' : (s === 'warn' ? 'degraded' : '')}">${esc(t)}</span>`;
+const pct = v => v == null ? 'n/a' : (Math.round(v * 1000) / 10) + '%';
+const crit = (title, status, label, body, buttons) => `<div class="crit"><div class="row"><b style="flex:1">${title}</b>${stp(status, label)}</div>${body}<div class="row" style="margin-top:.5rem">${buttons}</div></div>`;
+async function loadProof(){
+  const r = await api(`/api/runs/${rid}/proof`); if (!r.ok) return null;
+  proofCache = await r.json(); drawProof(); return proofCache;
+}
+function drawProof(){                       // one card per review point, each with live numbers and a drill-down button
+  const p = proofCache, o = p.orchestration, j = p.rejection, c = p.citations, t = p.trail, e = p.eval, m = p.metrics, rc = c.recheck;
+  const stages = Object.entries(j.by_stage).map(([k, v]) => `${esc(k)}: ${v}`).join(' · ') || 'none';
+  const ex = j.examples.slice(0, 2).map(x => `<div class="evp"><s>${esc(x.claim)}</s><br><small class="mut">${esc(x.stage)} — ${esc(x.reason)}</small></div>`).join('');
+  const removedAny = j.rejected + j.flagged > 0;
+  $('t-proof').innerHTML =
+   crit('1 · A coordinator orchestrates distinct agents and passes results between them', o.handoffs ? 'ok' : 'todo', o.handoffs ? 'shown' : 'waiting',
+     `<div>${o.llm_agents} LLM agents + the coordinator, <b>${o.distinct_prompts}</b> distinct prompts · <b>${o.handoffs}</b> handoffs recorded · <b>${o.loopbacks}</b> loop-back(s) to research</div>`,
+     `<button class="ghost" onclick="tab('handoffs')">See agents and handoffs</button>`) +
+   crit('2 · The verifier really rejects unsupported claims', removedAny ? 'ok' : (p.run_done ? 'warn' : 'todo'), removedAny ? 'shown' : (p.run_done ? 'nothing rejected' : 'waiting'),
+     `<div>${j.drafted} claims drafted → <b>${j.verified}</b> verified, ${j.flagged} flagged, <b>${j.rejected}</b> removed${j.sentences_dropped ? `, plus ${j.sentences_dropped} final sentence(s) dropped` : ''}.<br><small class="mut">Removed by: ${stages}</small></div>${ex}`,
+     `<button class="ghost" onclick="tab('removed')">Compare removed claims with their sources</button>`) +
+   crit('3 · Citations really support the sentences they are attached to', p.run_done ? (rc && rc.supported < rc.total ? 'warn' : 'ok') : 'todo', p.run_done ? (rc ? `${rc.supported}/${rc.total} re-checked` : 'audited') : 'waiting',
+     `<div><b>${c.kept}</b> report sentences, each tied to verified claims; ${c.dropped} more were dropped by the final audit (pass rate ${pct(c.audit_pass_rate)}).<br>` +
+       (rc ? `Independent re-check by <code>${esc((rc.models || [])[0] || '')}</code>: <b>${rc.supported}/${rc.total}</b> sentences supported${rc.supported < rc.total ? ' — amber/red sentences in the report need attention' : ''}.`
+           : '<small class="mut">Not independently re-checked yet: the button judges every sentence again with a different model.</small>') + '</div>',
+     `<button onclick="recheck()">Independently re-check every citation</button><button class="ghost" onclick="tab('report')">Open report (click a sentence for its quote)</button>`) +
+   crit('4 · A visible decision trail and honest, self-measured numbers', e.measured ? 'ok' : 'warn', e.measured ? 'measured' : 'not measured yet',
+     `<div>${t.events} events logged · ${t.searches} searches · ${t.pages} pages · ${t.llm_calls} LLM calls.<br>This run (system's own judge): first-pass groundedness <b>${pct(m.first_pass_groundedness)}</b>, audit pass rate <b>${pct(m.audit_pass_rate)}</b>, coverage <b>${m.subquestions_fully_covered ?? '–'}/${m.subquestions ?? '–'}</b> sub-questions, cost <b>$${m.cost_usd ?? '–'}</b>.<br>` +
+       (e.measured ? `Across ${e.questions} test questions: ${Object.entries(e.average || {}).map(([k, v]) => `${esc(k)} <b>${v}</b>`).join(' · ')}`
+                   : `<span style="color:var(--warn)">No evaluation results recorded yet.</span> Run <code>${esc(e.command)}</code>.`) + '</div>',
+     `<button class="ghost" onclick="tab('selfeval')">Self-evaluation and definitions</button><button class="ghost" onclick="tab('files')">Download the full trail</button>`);
+}
+
+// ---------- agents and handoffs ----------
+async function loadHandoffs(){
+  const j = await (await api(`/api/runs/${rid}/handoffs`)).json(), groups = {};
+  j.handoffs.forEach(h => (groups[h.round] = groups[h.round] || []).push(h));
+  const order = Object.keys(groups).map(Number).sort((a, b) => (a < 0 ? 1e9 : a) - (b < 0 ? 1e9 : b));   // finalisation last
+  $('t-handoffs').innerHTML = '<h3>Agents — each with its own job and its own prompt or tools</h3><div class="scroll" style="max-height:none"><table><thead><tr><th>agent</th><th>job</th><th>tools</th><th>model chain</th><th>own prompt</th></tr></thead><tbody>' +
+    j.agents.map(a => `<tr><td><b>${esc(a.agent)}</b></td><td>${esc(a.job)}</td><td>${esc(a.tools)}</td><td class="mut">${a.models.map(esc).join(' → ') || '—'}</td><td class="mut">${a.prompt_id ? `#${a.prompt_id} · ${a.prompt_chars} chars` : 'logic, no prompt'}</td></tr>`).join('') +
+    '</tbody></table></div><h3 style="margin-top:1rem">Results passed between agents</h3>' +
+    (order.map(r => `<div class="mut" style="margin:.5rem 0 .2rem"><b>${r < 0 ? 'Finalisation' : 'Research round ' + (r + 1)}</b></div>` +
+      groups[r].map(h => `<div class="hand ${h.artifact.startsWith('LOOP') ? 'loop' : ''}"><span class="pill">${esc(h.from)}</span> <span class="arrow">→</span> <span class="pill">${esc(h.to)}</span> <b>${esc(h.artifact)}</b><div class="mut">${esc(h.detail)}</div></div>`).join('')).join('') || '<p class="mut">No handoffs recorded yet.</p>');
+}
+
+// ---------- removed claims, side by side with their sources ----------
+const hiNums = (text, bad) => { let h = esc(text);
+  bad.forEach(n => { h = h.replace(new RegExp('(^|[^\\d.,])(' + n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')(?![\\d])', 'g'), '$1<mark class="bad">$2</mark>'); });
+  return h; };
+async function loadRemoved(){
+  const j = await (await api(`/api/runs/${rid}/removed`)).json();
+  $('t-removed').innerHTML = (j.claims.length ? j.claims.map(c => `<div class="cmp-card">
+     <div class="row"><b>Claim ${c.claim_id}</b><span class="pill ${c.status === 'rejected' ? 'failed' : 'degraded'}">${esc(c.status)}</span><span class="pill">${esc(c.stage)}</span><small class="mut">${esc(c.subquestion)}</small></div>
+     <div class="cmp"><div><div class="mut"><b>What the claim says</b></div>${hiNums(c.claim, c.bad_numbers)}
+        <div class="mut" style="margin-top:.3rem">Quote it cited: “${esc(c.quote || '(none)')}” ${c.quote_found ? '<span class="pill done">found in source</span>' : '<span class="pill failed">not in source</span>'}</div></div>
+       <div><div class="mut"><b>What the source says</b> ${c.source_url ? '· ' + link(c.source_url) : ''}</div>${c.passage ? hl(c.passage, c.quote) : '<span class="mut">(the cited evidence does not exist)</span>'}</div></div>
+     <div class="why"><b>Why removed:</b> ${esc(c.reason)}${c.bad_numbers.length ? ` · numbers not in source: <mark class="bad">${c.bad_numbers.map(esc).join(', ')}</mark>` : ''}</div></div>`).join('')
+     : '<p class="mut">No claims were removed in this run.</p>') +
+    (j.sentences.length ? '<h3>Report sentences dropped by the final audit</h3>' + j.sentences.map(s => `<div class="evp"><s>${esc(s.text)}</s><br><small class="mut">${esc(s.verdict)} — ${esc(s.reason)}</small></div>`).join('') : '');
+}
+
+// ---------- self-evaluation: measured numbers, or an honest "not measured yet" ----------
+async function loadSelfEval(){
+  const ev = await (await api('/api/eval')).json(), pr = proofCache || await loadProof(), m = pr ? pr.metrics : {};
+  const chip = (k, v) => `<span class="chip">${esc(k)} <b>${esc(v)}</b></span>`;
+  let h = `<h3>This run <small class="mut">(measured by the system's own judge)</small></h3><div class="row">${chip('first-pass groundedness', pct(m.first_pass_groundedness))}${chip('audit pass rate', pct(m.audit_pass_rate))}${chip('coverage', (m.subquestions_fully_covered ?? '–') + '/' + (m.subquestions ?? '–'))}${chip('rounds', m.research_rounds ?? '–')}${chip('cost', '$' + (m.cost_usd ?? '–'))}</div>`;
+  if (ev.measured) {
+    const R = ev.results.rows, avg = ev.results.average || {};
+    h += `<h3 style="margin-top:1rem">Across the test set <small class="mut">(${R.length} questions${ev.results.generated_at ? ', ' + esc(ev.results.generated_at.slice(0, 10)) : ''})</small></h3><div class="scroll" style="max-height:none"><table><thead><tr><th>question</th><th>drafted</th><th>rejected</th><th>first-pass</th><th>audit</th><th>independent</th><th>coverage</th><th>rounds</th><th>cost $</th></tr></thead><tbody>` +
+      R.map(r => r.error ? `<tr class="bad"><td>${esc(r.id)}</td><td colspan="8">failed: ${esc(r.error)}</td></tr>` : `<tr><td>${esc(r.id)}</td><td>${r.claims_drafted}</td><td>${r.claims_rejected}</td><td>${r.first_pass_groundedness}</td><td>${r.audit_pass_rate}</td><td>${r.independent_groundedness}</td><td>${r.coverage}</td><td>${r.rounds}</td><td>${r.cost_usd}</td></tr>`).join('') +
+      `<tr><td><b>average</b></td><td></td><td></td><td><b>${avg.first_pass_groundedness ?? ''}</b></td><td><b>${avg.audit_pass_rate ?? ''}</b></td><td><b>${avg.independent_groundedness ?? ''}</b></td><td><b>${avg.coverage ?? ''}</b></td><td><b>${avg.rounds ?? ''}</b></td><td><b>${avg.cost_usd ?? ''}</b></td></tr></tbody></table></div>`;
+  } else {
+    h += `<div class="crit"><b style="color:var(--warn)">Not measured yet.</b> No evaluation results are recorded, so no groundedness numbers are claimed. Run <code>${esc(ev.command)}</code>; results appear here automatically.</div>`;
+  }
+  if (ev.redteam) {
+    const A = ev.redteam.attacks;
+    h += `<h3 style="margin-top:1rem">Red-team: can the verifier catch corrupted claims? <small class="mut">(run #${ev.redteam.run_id})</small></h3><table><thead><tr><th>attack</th><th>corrupted</th><th>caught</th><th>catch rate</th></tr></thead><tbody>` +
+      Object.entries(A).map(([k, v]) => `<tr><td>${esc(k)}</td><td>${v.corrupted}</td><td>${v.caught}</td><td>${v.corrupted ? (v.caught / v.corrupted).toFixed(2) : 'n/a'}</td></tr>`).join('') +
+      `<tr><td><b>all</b></td><td>${ev.redteam.total_corrupted}</td><td>${ev.redteam.total_caught}</td><td><b>${ev.redteam.total_corrupted ? (ev.redteam.total_caught / ev.redteam.total_corrupted).toFixed(2) : 'n/a'}</b></td></tr></tbody></table>`;
+  } else {
+    h += '<p class="mut">Red-team not run yet (<code>python -m eval.redteam &lt;run_id&gt;</code>).</p>';
+  }
+  h += '<details open style="margin-top:1rem"><summary><b>How each number is computed</b></summary>' + Object.entries(ev.definitions).map(([k, v]) => `<div class="evp"><b>${esc(k)}</b>: ${esc(v)}</div>`).join('') + '</details>' +
+       '<details open><summary><b>Limits of these measurements</b></summary>' + ev.limitations.map(x => `<div class="evp">${esc(x)}</div>`).join('') + '</details>';
+  $('t-selfeval').innerHTML = h;
+}
+
+// ---------- independent citation re-check ----------
+async function recheck(){
+  $('rcmsg').textContent = 'judging every report sentence with a different model…';
+  const r = await api(`/api/runs/${rid}/recheck`, {method:'POST'});
+  if (!r.ok) { $('rcmsg').textContent = (await r.json()).detail; return; }
+  await loadProof(); paintRecheck();
+}
+function paintRecheck(){                    // underline each sentence by its independent verdict (green / amber / red)
+  const rc = proofCache && proofCache.citations.recheck;
+  if (!rc) { $('rcmsg').textContent = ''; return; }
+  const by = {}; rc.results.forEach(x => by[x.loc] = x);
+  document.querySelectorAll('#report .s').forEach(el => {
+    const x = by[el.dataset.loc]; el.classList.remove('v-supported', 'v-partial', 'v-bad');
+    if (x) { el.classList.add(x.verdict === 'supported' ? 'v-supported' : (x.verdict === 'partial' ? 'v-partial' : 'v-bad')); el.title = 'independent re-check: ' + x.verdict + ' — ' + x.reason; }
+  });
+  $('rcmsg').textContent = `independent re-check: ${rc.supported}/${rc.total} sentences supported`;
+}
+
+$('report').addEventListener('click', onSentence);
+
+// ---------- on load: show the run list and attach to the newest run ----------
+loadRuns().then(rs => { if (rs.length) select(rs[0].id); });
+setInterval(loadRuns, 8000);
+</script>
